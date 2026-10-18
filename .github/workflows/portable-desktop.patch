@@ -1,0 +1,117 @@
+diff --git a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Files.desktop.kt b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Files.desktop.kt
+index 58260181c..b9bb99ca0 100644
+--- a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Files.desktop.kt
++++ b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Files.desktop.kt
+@@ -12,7 +12,10 @@ import java.net.URI
+ actual val dataDir: File = File(desktopPlatform.dataPath)
+ // No deleteOnExit() here: a transient second instance also inits this val, and its exit
+ // would delete the shared folder while the primary runs. Registered in Main instead.
+-actual val tmpDir: File = File(System.getProperty("java.io.tmpdir") + File.separator + "simplex")
++// In portable mode keep it under the data dir so nothing is written to the system temp dir.
++actual val tmpDir: File =
++  if (simplexDataDirOverride != null) File(dataDir.absolutePath + File.separator + "app_tmp")
++  else File(System.getProperty("java.io.tmpdir") + File.separator + "simplex")
+ actual val filesDir: File = File(dataDir.absolutePath + File.separator + "simplex_v1_files")
+ actual val appFilesDir: File = filesDir
+ actual val wallpapersDir: File = File(dataDir.absolutePath + File.separator + "simplex_v1_assets" + File.separator + "wallpapers").also { it.mkdirs() }
+diff --git a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Platform.desktop.kt b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Platform.desktop.kt
+index 7ea41d359..20097e5a2 100644
+--- a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Platform.desktop.kt
++++ b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Platform.desktop.kt
+@@ -4,14 +4,40 @@ import java.io.File
+ import java.util.*
+ 
+ private val home = System.getProperty("user.home")
+-private val unixConfigPath = (System.getenv("XDG_CONFIG_HOME") ?: "$home/.config") + "/simplex"
+-private val unixDataPath = (System.getenv("XDG_DATA_HOME") ?: "$home/.local/share") + "/simplex"
++
++// Portable mode. If set, all app data, settings and temporary files are stored under this
++// single directory instead of the per-user platform locations, so the app leaves nothing
++// behind in the user profile and can live entirely on a removable drive.
++//
++// Resolution order:
++//   1. SIMPLEX_DATA_DIR environment variable
++//   2. -Dsimplex.data.dir=... JVM property
++//   3. a `portable` marker file or directory placed next to the app launcher
++//      (jpackage sets jpackage.app-path; falls back to the Compose resources directory)
++val simplexDataDirOverride: String? by lazy {
++  val explicit = (System.getenv("SIMPLEX_DATA_DIR") ?: System.getProperty("simplex.data.dir"))
++    ?.trim()
++    ?.takeIf { it.isNotEmpty() }
++  explicit ?: portableMarkerDir()
++}
++
++private fun portableMarkerDir(): String? {
++  val launcherDir =
++    System.getProperty("jpackage.app-path")?.let { File(it).absoluteFile.parentFile }
++      ?: System.getProperty("compose.application.resources.dir")?.let { File(it).absoluteFile.parentFile?.parentFile }
++      ?: return null
++  return if (File(launcherDir, "portable").exists()) File(launcherDir, "data").absolutePath else null
++}
++
++private val unixConfigPath = simplexDataDirOverride ?: ((System.getenv("XDG_CONFIG_HOME") ?: "$home/.config") + "/simplex")
++private val unixDataPath = simplexDataDirOverride ?: ((System.getenv("XDG_DATA_HOME") ?: "$home/.local/share") + "/simplex")
++private val windowsPath = simplexDataDirOverride ?: (System.getenv("AppData") + File.separator + "SimpleX")
+ val desktopPlatform = detectDesktopPlatform()
+ 
+ enum class DesktopPlatform(val libExtension: String, val configPath: String, val dataPath: String, val githubAssetName: String) {
+   LINUX_X86_64("so", unixConfigPath, unixDataPath, "simplex-desktop-x86_64.AppImage"),
+   LINUX_AARCH64("so", unixConfigPath, unixDataPath, "simplex-desktop-aarch64.AppImage"),
+-  WINDOWS_X86_64("dll", System.getenv("AppData") + File.separator + "SimpleX", System.getenv("AppData") + File.separator + "SimpleX", "simplex-desktop-windows-x86_64.msi"),
++  WINDOWS_X86_64("dll", windowsPath, windowsPath, "simplex-desktop-windows-x86_64.msi"),
+   MAC_X86_64("dylib", unixConfigPath, unixDataPath, "simplex-desktop-macos-x86_64.dmg"),
+   MAC_AARCH64("dylib", unixConfigPath, unixDataPath, "simplex-desktop-macos-aarch64.dmg");
+ 
+diff --git a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt
+index d59677b72..d0bf9ba54 100644
+--- a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt
++++ b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt
+@@ -18,9 +18,11 @@ import kotlin.math.max
+ // on the render thread while vlcPreviewFactory is built on the preview thread) corrupts the ServiceLoader
+ // enumeration and throws NoSuchElementException from CompoundEnumeration.nextElement.
+ private val vlcFactoryLock = Any()
+-internal val vlcFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory() } }
++// `--no-config` keeps libvlc from reading/writing its config under the user profile
++// (%APPDATA%\vlc on Windows), so the app stays self-contained in one folder.
++internal val vlcFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory("--no-config") } }
+ // No hardware acceleration - more secure for previews
+-internal val vlcPreviewFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory("--avcodec-hw=none") } }
++internal val vlcPreviewFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory("--avcodec-hw=none", "--no-config") } }
+ 
+ actual class RecorderNative: RecorderInterface {
+   private var player: MediaPlayer? = null
+diff --git a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt
+index e857ef91b..10eba1e14 100644
+--- a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt
++++ b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt
+@@ -160,6 +160,12 @@ fun showAppUpdateNotice() {
+ private var updateCheckerJob: Job = Job()
+ fun setupUpdateChecker() = withLongRunningApi {
+   updateCheckerJob.cancel()
++  // Portable builds are updated by replacing the folder manually. Running the updater would
++  // download to the portable folder and then install an MSI into Program Files (breaking
++  // portability), and would contact GitHub in the background, so skip it entirely.
++  if (simplexDataDirOverride != null) {
++    return@withLongRunningApi
++  }
+   if (appPrefs.appUpdateChannel.get() == AppUpdatesChannel.DISABLED) {
+     return@withLongRunningApi
+   }
+diff --git a/apps/multiplatform/desktop/src/jvmMain/kotlin/chat/simplex/desktop/Main.kt b/apps/multiplatform/desktop/src/jvmMain/kotlin/chat/simplex/desktop/Main.kt
+index e407448d1..527864abd 100644
+--- a/apps/multiplatform/desktop/src/jvmMain/kotlin/chat/simplex/desktop/Main.kt
++++ b/apps/multiplatform/desktop/src/jvmMain/kotlin/chat/simplex/desktop/Main.kt
+@@ -21,6 +21,13 @@ import java.io.File
+ 
+ fun main() {
+   try {
++    // Portable mode: keep JVM temp files (native library extraction, e.g. Skiko) and the
++    // java.util.prefs store inside the portable data directory instead of the system temp
++    // dir / user registry.
++    simplexDataDirOverride?.let {
++      System.setProperty("java.io.tmpdir", File(dataDir, "app_tmp").absolutePath)
++      System.setProperty("java.util.prefs.userRoot", File(dataDir, "prefs").absolutePath)
++    }
+     if (!acquireSingleInstance()) return
+     // Clean shared temp dirs only in the owning instance (not in a Files.desktop val
+     // initializer, which a transient second instance would also run). Early: before settings writes.

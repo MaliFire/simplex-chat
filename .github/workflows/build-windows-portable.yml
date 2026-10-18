@@ -1,0 +1,169 @@
+name: Build Windows portable
+
+# Builds a fully self-contained, portable Windows desktop build:
+#   * builds the Haskell core (libsimplex.dll) and the desktop app image
+#     (`createDistributable`, i.e. the raw jpackage app image, not an installer),
+#   * drops a `portable` marker next to the launcher, which makes Platform.desktop.kt
+#     keep ALL data (databases, files, settings, temp) inside <app dir>/data and
+#     write nothing to %APPDATA%, %LOCALAPPDATA% or %TEMP%,
+#   * zips the folder so it can be extracted anywhere (e.g. a USB drive) and run.
+#
+# NOTE: the portable-mode source changes ship as `portable-desktop.patch`, stored next
+# to this file, and are applied to the checkout before building. The repo source itself
+# stays unmodified. If the patch is already applied (e.g. it was committed), the apply
+# step is skipped.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-portable:
+    name: "windows-latest (portable Desktop)"
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      GHC_VER: 9.6.3
+      JAVA_VER: "17"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Apply portable mode patch
+        shell: bash
+        run: |
+          set -e
+          src='apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Platform.desktop.kt'
+          patch_file='.github/workflows/portable-desktop.patch'
+          if grep -q 'simplexDataDirOverride' "$src" 2>/dev/null; then
+            echo "Portable patch already applied, skipping"
+            exit 0
+          fi
+          # Normalise line endings so the LF patch matches regardless of the runner's core.autocrlf
+          git config core.autocrlf false
+          git config core.eol lf
+          git checkout-index -f -a
+          # tolerate a CRLF patch (e.g. if it was pasted into the GitHub web editor)
+          sed -i 's/\r$//' "$patch_file"
+          git apply --verbose "$patch_file" || git apply --verbose --ignore-whitespace "$patch_file"
+          grep -q 'simplexDataDirOverride' "$src"
+          echo "Portable patch applied"
+
+      - name: Setup Java
+        # ./.github/actions/prepare-build only installs Java when building a `v*` tag,
+        # and this workflow is expected to run on workflow_dispatch, so install it here.
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'corretto'
+          java-version: ${{ env.JAVA_VER }}
+          cache: 'gradle'
+
+      - name: Prepare build
+        uses: ./.github/actions/prepare-build
+        with:
+          java_ver: ${{ env.JAVA_VER }}
+          ghc_ver: ${{ env.GHC_VER }}
+          os: windows-latest
+          cache_path: "C:/cabal"
+          github_ref: ${{ github.ref }}
+
+      - name: Configure pagefile (Windows)
+        uses: simplex-chat/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 16GB
+          disk-root: "C:"
+
+      - name: Setup MSYS2
+        uses: simplex-chat/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          update: true
+          install: >-
+            git
+            perl
+            make
+          pacboy: >-
+            toolchain:p
+            cmake:p
+
+      - name: Build native library (Haskell core + VLC + OpenSSL)
+        shell: msys2 {0}
+        run: |
+          export PATH=$PATH:/c/ghcup/bin:$(echo /c/tools/ghc-*/bin || echo)
+          scripts/desktop/build-lib-windows.sh
+
+      # Same as the release workflow (build.yml), but createDistributable instead of
+      # packageMsi, so we get the relocatable app image rather than an installer.
+      - name: Build portable distributable
+        shell: msys2 {0}
+        run: |
+          export PATH=$PATH:/c/ghcup/bin:$(echo /c/tools/ghc-*/bin || echo)
+          cd apps/multiplatform
+          ./gradlew -Psimplex.assets.dir=../../assets createDistributable
+          rm -rf dist-newstyle/src/direct-sq* dist-newstyle/src/simplexmq* 2>/dev/null || true
+
+      - name: Make folder portable and archive it
+        id: portable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # The app image is produced by `createDistributable` under
+          # apps/multiplatform/release/main/app/<packageName>; the launcher is SimpleX.exe.
+          $roots = @('apps/multiplatform/release', 'apps/multiplatform/desktop/build')
+          $launcher = $null
+          foreach ($r in $roots) {
+            if (Test-Path $r) {
+              $launcher = Get-ChildItem -Path $r -Recurse -Filter 'SimpleX.exe' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -notmatch '\\runtime\\' } | Select-Object -First 1
+              if ($launcher) { break }
+            }
+          }
+          if (-not $launcher) { throw 'SimpleX.exe not found in the built distributable' }
+
+          $appDir = $launcher.Directory
+          Write-Host "Portable app directory: $($appDir.FullName)"
+
+          # The `portable` marker makes the app keep everything in <appDir>/data (see Platform.desktop.kt).
+          New-Item -ItemType File -Path (Join-Path $appDir.FullName 'portable') -Force | Out-Null
+
+          $readme = @'
+          SimpleX Chat - portable build
+          =============================
+
+          This folder is fully self-contained. Everything the app writes (databases,
+          received files, settings, temporary files) goes into the "data" subfolder
+          next to SimpleX.exe. Nothing is written to %APPDATA%, %LOCALAPPDATA% or %TEMP%.
+
+          Just run SimpleX.exe.
+
+          The "portable" marker file in this folder enables this behaviour
+          (see Platform.desktop.kt). Remove it to fall back to the normal
+          per-user locations.
+          '@
+          Set-Content -Path (Join-Path $appDir.FullName 'PORTABLE-README.txt') -Value $readme -Encoding UTF8
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'simplex-desktop-windows-x86_64-portable.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          & tar.exe -caf $zip -C $appDir.Parent.FullName $appDir.Name
+          if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+
+          Get-Item $zip | Format-List Name, Length
+          "archive=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simplex-desktop-windows-x86_64-portable
+          path: ${{ steps.portable.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 30
