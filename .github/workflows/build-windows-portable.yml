@@ -107,12 +107,13 @@ jobs:
           restore-keys: |
             windows-openssl-3.0.15-
 
-      - name: Configure pagefile (Windows)
-        uses: simplex-chat/configure-pagefile-action@v1.4
-        with:
-          minimum-size: 16GB
-          maximum-size: 16GB
-          disk-root: "C:"
+      # build.yml grows the pagefile to 16GB here (its Linux twin is the 30GB swap step),
+      # as insurance against the Haskell link step exhausting commit space. It is omitted:
+      # the action preallocates the whole 16GB on C: when it runs, and that happens after
+      # setup-java/prepare-build have unpacked several GB of caches onto C:, so on a
+      # cache-hit run it fails with a useless "The operation completed successfully"
+      # (NtCreatePagingFile NTSTATUS reported through GetLastWin32Error). The runner's
+      # system-managed pagefile is left as-is instead.
 
       - name: Setup MSYS2
         uses: simplex-chat/setup-msys2@v2
