@@ -62,24 +62,6 @@ index 7ea41d359..20097e5a2 100644
    MAC_X86_64("dylib", unixConfigPath, unixDataPath, "simplex-desktop-macos-x86_64.dmg"),
    MAC_AARCH64("dylib", unixConfigPath, unixDataPath, "simplex-desktop-macos-aarch64.dmg");
  
-diff --git a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt
-index d59677b72..d0bf9ba54 100644
---- a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt
-+++ b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/RecAndPlay.desktop.kt
-@@ -18,9 +18,11 @@ import kotlin.math.max
- // on the render thread while vlcPreviewFactory is built on the preview thread) corrupts the ServiceLoader
- // enumeration and throws NoSuchElementException from CompoundEnumeration.nextElement.
- private val vlcFactoryLock = Any()
--internal val vlcFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory() } }
-+// `--no-config` keeps libvlc from reading/writing its config under the user profile
-+// (%APPDATA%\vlc on Windows), so the app stays self-contained in one folder.
-+internal val vlcFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory("--no-config") } }
- // No hardware acceleration - more secure for previews
--internal val vlcPreviewFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory("--avcodec-hw=none") } }
-+internal val vlcPreviewFactory: MediaPlayerFactory by lazy { synchronized(vlcFactoryLock) { MediaPlayerFactory("--avcodec-hw=none", "--no-config") } }
- 
- actual class RecorderNative: RecorderInterface {
-   private var player: MediaPlayer? = null
 diff --git a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt b/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt
 index e857ef91b..10eba1e14 100644
 --- a/apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt
