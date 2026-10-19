@@ -27,40 +27,50 @@ jobs:
   build-windows-portable:
     name: "windows-latest (portable Desktop)"
     runs-on: windows-latest
-    timeout-minutes: 240
+    # Cold run is ~53 min, cached ~20; anything above two hours is a hang.
+    timeout-minutes: 120
     env:
       GHC_VER: 9.6.3
       JAVA_VER: "17"
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Apply portable mode patch
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           src='apps/multiplatform/common/src/desktopMain/kotlin/chat/simplex/common/platform/Platform.desktop.kt'
           patch_file='.github/workflows/portable-desktop.patch'
           if grep -q 'simplexDataDirOverride' "$src" 2>/dev/null; then
             echo "Portable patch already applied, skipping"
             exit 0
           fi
-          # Normalise line endings so the LF patch matches regardless of the runner's core.autocrlf
+          # The patch is stored with LF endings; normalise a CRLF copy (e.g. if it was
+          # pasted into the GitHub web editor).
+          sed -i 's/\r$//' "$patch_file"
+          # actions/checkout writes CRLF into the worktree on Windows (core.autocrlf=true),
+          # and `git checkout-index -f -a` does NOT rewrite files whose stat data is already
+          # current, so it cannot be used to normalise them. Delete and re-materialise only
+          # the files the patch touches, which guarantees LF content and a clean apply.
           git config core.autocrlf false
           git config core.eol lf
-          git checkout-index -f -a
-          # tolerate a CRLF patch (e.g. if it was pasted into the GitHub web editor)
-          sed -i 's/\r$//' "$patch_file"
-          git apply --verbose "$patch_file" || git apply --verbose --ignore-whitespace "$patch_file"
+          while IFS= read -r f; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              rm -f "$f"
+              git checkout-index -f -- "$f"
+            fi
+          done < <(sed -n 's|^+++ b/||p' "$patch_file")
+          git apply "$patch_file"
           grep -q 'simplexDataDirOverride' "$src"
           echo "Portable patch applied"
 
       - name: Setup Java
         # ./.github/actions/prepare-build only installs Java when building a `v*` tag,
         # and this workflow is expected to run on workflow_dispatch, so install it here.
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v6
         with:
           distribution: 'corretto'
           java-version: ${{ env.JAVA_VER }}
@@ -74,6 +84,28 @@ jobs:
           os: windows-latest
           cache_path: "C:/cabal"
           github_ref: ${{ github.ref }}
+
+      - name: Cache OpenSSL build
+        # scripts/desktop/prepare-openssl-windows.sh compiles OpenSSL from source (~18 min
+        # in the last run) and skips it entirely when
+        # dist-newstyle/openssl-3.0.15/libcrypto-3-x64.dll already exists.
+        #
+        # The `prepare-build` cache above already includes dist-newstyle, but its key hashes
+        # cabal.project + simplex-chat.cabal, so any dependency bump throws away the whole
+        # tree - including the OpenSSL build. This step keeps that one directory under a
+        # stable key so a cache-key change does not cost another OpenSSL compile.
+        # restore-keys lets it reuse the tree even if prepare-openssl-windows.sh changes.
+        #
+        # Skipped when `prepare-build` already restored dist-newstyle (the common case), so
+        # there is no redundant extraction. On a run where that cache misses, this restores
+        # the tree and its post-step saves it for the next such miss.
+        if: hashFiles('dist-newstyle/openssl-3.0.15/libcrypto-3-x64.dll') == ''
+        uses: actions/cache@v6
+        with:
+          path: dist-newstyle/openssl-3.0.15
+          key: windows-openssl-3.0.15-${{ hashFiles('scripts/desktop/prepare-openssl-windows.sh') }}
+          restore-keys: |
+            windows-openssl-3.0.15-
 
       - name: Configure pagefile (Windows)
         uses: simplex-chat/configure-pagefile-action@v1.4
@@ -103,13 +135,13 @@ jobs:
 
       # Same as the release workflow (build.yml), but createDistributable instead of
       # packageMsi, so we get the relocatable app image rather than an installer.
+      # --console=plain keeps progress-bar escape sequences out of the CI log.
       - name: Build portable distributable
         shell: msys2 {0}
         run: |
           export PATH=$PATH:/c/ghcup/bin:$(echo /c/tools/ghc-*/bin || echo)
           cd apps/multiplatform
-          ./gradlew -Psimplex.assets.dir=../../assets createDistributable
-          rm -rf dist-newstyle/src/direct-sq* dist-newstyle/src/simplexmq* 2>/dev/null || true
+          ./gradlew -Psimplex.assets.dir=../../assets createDistributable --console=plain
 
       - name: Make folder portable and archive it
         id: portable
@@ -161,9 +193,15 @@ jobs:
           "archive=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload portable artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
+          # `archive: false` uploads the zip as-is, so the downloaded artifact IS the
+          # ready-to-extract portable zip. Re-archiving it (the default) would wrap it in
+          # a second zip and burn ~2 min recompressing data that is already compressed.
+          # With archive: false the artifact name is taken from the file name, so the
+          # `name` input below is informational only.
           name: simplex-desktop-windows-x86_64-portable
           path: ${{ steps.portable.outputs.archive }}
+          archive: false
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
